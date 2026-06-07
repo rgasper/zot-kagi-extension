@@ -53,8 +53,17 @@ def _capture_search(args: dict, env: dict | None = None) -> dict:
 
 
 @contextmanager
+def _auto_approve():
+    """Patch the approval gate to always approve — used in all non-denial tests."""
+    with patch("main._request_approval", return_value=True):
+        yield
+
+
+@contextmanager
 def _mock_search_api(response=None, side_effect=None):
-    """Patch _client() so SearchApi.search returns `response` or raises `side_effect`."""
+    """Patch _client() so SearchApi.search returns `response` or raises `side_effect`.
+    Also auto-approves the permission gate so tests never block.
+    """
     mock_api = MagicMock()
     if side_effect is not None:
         mock_api.search.side_effect = side_effect
@@ -65,9 +74,10 @@ def _mock_search_api(response=None, side_effect=None):
     mock_client.__enter__ = MagicMock(return_value=mock_client)
     mock_client.__exit__ = MagicMock(return_value=False)
 
-    with patch("main._client", return_value=mock_client):
-        with patch("openapi_client.SearchApi", return_value=mock_api):
-            yield mock_api
+    with _auto_approve():
+        with patch("main._client", return_value=mock_client):
+            with patch("openapi_client.SearchApi", return_value=mock_api):
+                yield mock_api
 
 
 # ---------------------------------------------------------------------------
@@ -85,11 +95,13 @@ class TestSearchInputValidation:
         assert frame["is_error"] is True
 
     def test_missing_api_key_returns_error(self):
-        # Don't set KAGI_API_KEY at all
+        # Don't set KAGI_API_KEY at all — gate is auto-approved so we reach
+        # the _client() check, which raises RuntimeError caught as is_error.
         buf = StringIO()
-        with patch.dict("os.environ", {}, clear=True):
-            with patch("sys.stdout", buf):
-                main.handle_kagi_search("c1", {"query": "hello"})
+        with _auto_approve():
+            with patch.dict("os.environ", {}, clear=True):
+                with patch("sys.stdout", buf):
+                    main.handle_kagi_search("c1", {"query": "hello"})
         frame = json.loads(buf.getvalue().strip())
         assert frame["is_error"] is True
         assert "KAGI_API_KEY" in frame["content"][0]["text"]
@@ -249,3 +261,30 @@ class TestSearchApiErrors:
         with _mock_search_api(side_effect=exc):
             frame = _capture_search({"query": "test"})
         assert frame["type"] == "tool_result"
+
+
+# ---------------------------------------------------------------------------
+# Approval gate tests
+# ---------------------------------------------------------------------------
+
+class TestSearchApprovalGate:
+    def test_denied_returns_error_to_agent(self):
+        with patch("main._request_approval", return_value=False):
+            frame = _capture_search({"query": "test"})
+        assert frame["is_error"] is True
+        assert "denied" in frame["content"][0]["text"].lower()
+
+    def test_denied_message_tells_agent_not_to_retry(self):
+        with patch("main._request_approval", return_value=False):
+            frame = _capture_search({"query": "test"})
+        text = frame["content"][0]["text"]
+        assert "without asking" in text.lower() or "do not retry" in text.lower()
+
+    def test_approval_description_includes_query(self):
+        captured = {}
+        def fake_approve(description):
+            captured["desc"] = description
+            return False
+        with patch("main._request_approval", side_effect=fake_approve):
+            _capture_search({"query": "best cat breeds"})
+        assert "best cat breeds" in captured["desc"]
