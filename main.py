@@ -83,13 +83,8 @@ def _request_approval(description: str) -> bool:
             return False
         _pending = approval
 
-    notify(
-        "warn",
-        f"⏸ Kagi API call requested (costs money):\n"
-        f"  {description}\n"
-        f"  → /kagi-approve  to allow\n"
-        f"  → /kagi-deny     to cancel",
-    )
+    notify("warn", f"Kagi API call pending (costs money): {description}")
+    notify("warn", "type /kagi-approve to allow, or /kagi-deny to cancel")
 
     approval.event.wait()  # blocks until /kagi-approve or /kagi-deny fires
 
