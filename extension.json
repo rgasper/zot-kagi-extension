@@ -1,0 +1,9 @@
+{
+  "name": "kagi",
+  "version": "1.0.0",
+  "exec": "uv",
+  "args": ["run", "main.py"],
+  "language": "python",
+  "description": "Kagi web search and URL content extraction tools",
+  "enabled": true
+}

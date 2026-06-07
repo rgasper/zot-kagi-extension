@@ -1,0 +1,25 @@
+[project]
+name = "zot-kagi-extension"
+version = "1.0.0"
+description = "Kagi search and extract tools for the zot coding agent"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "openapi-client @ git+https://github.com/kagisearch/kagi-openapi-python.git",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-mock>=3.14",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-mock>=3.15.1",
+]
