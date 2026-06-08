@@ -21,7 +21,8 @@ def capture(fn, call_id, args, api_key):
     buf = StringIO()
     with patch.dict("os.environ", {"KAGI_API_KEY": api_key}, clear=False):
         with patch("sys.stdout", buf):
-            fn(call_id, args)
+            with patch("main._request_approval", return_value=True):
+                fn(call_id, args)
     return json.loads(buf.getvalue().strip())
 
 
