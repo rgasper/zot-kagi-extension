@@ -11,21 +11,13 @@ LLM-callable tools backed by the [Kagi API](https://kagi.com/api):
 ## Prerequisites
 
 - Python 3.10+
+- [`uv`](https://github.com/astral-sh/uv) — used to run the extension (manages its own virtualenv automatically)
 - A Kagi API key — get one at <https://kagi.com/api>
-- `uv` or `pip`
 - `zot` installed and on `$PATH`
 
 ## Installation
 
-### 1. Install the Kagi Python SDK
-
-```bash
-pip install git+https://github.com/kagisearch/kagi-openapi-python.git
-# or with uv:
-uv pip install git+https://github.com/kagisearch/kagi-openapi-python.git
-```
-
-### 2. Set your API key
+### 1. Set your API key
 
 Add this to your shell profile (`~/.zshrc`, `~/.bashrc`, etc.):
 
@@ -33,24 +25,18 @@ Add this to your shell profile (`~/.zshrc`, `~/.bashrc`, etc.):
 export KAGI_API_KEY=your_api_key_here
 ```
 
-### 3. Make the script executable
+### 2. Install the extension
 
 ```bash
-chmod +x main.py
+zot ext install https://github.com/rgasper/zot-kagi-extension
 ```
 
-### 4. Load the extension
+This clones the repo into `$ZOT_HOME/extensions/` so `zot update` can keep it current alongside your other extensions.
 
-**For a single zot session (no install needed — great for development):**
+**For a single zot session (no install, great for development):**
 
 ```bash
 zot --ext /path/to/zot-kagi-extension
-```
-
-**To install globally:**
-
-```bash
-zot ext install /path/to/zot-kagi-extension
 ```
 
 ## Tools
