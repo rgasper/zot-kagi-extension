@@ -5,9 +5,8 @@ Reads KAGI_API_KEY from the environment.
 User-approval gate
 ------------------
 Every tool call is held until the user explicitly approves or denies it
-via an interactive yes/no panel.  The panel opens automatically when a
-Kagi API call is pending; the user navigates with arrow keys and
-confirms with Enter (or cancels with Esc).
+via /kagi-approve or /kagi-deny slash commands.  When a Kagi API call
+is pending, a notification tells the user which command to run.
 
 Only one Kagi call can be pending at a time.  If the agent fires a
 second call while one is already waiting, it is immediately denied.
@@ -19,7 +18,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Callable
 
-import openapi_client
+import openapi_client  # type: ignore
 
 # ---------------------------------------------------------------------------
 # Wire-protocol helpers
@@ -55,72 +54,25 @@ def notify(level: str, message: str) -> None:
     emit({"type": "notify", "level": level, "message": message})
 
 # ---------------------------------------------------------------------------
-# Approval panel
+# Approval gate (slash-command based)
 # ---------------------------------------------------------------------------
-
-PANEL_ID = "kagi-approve"
-
-# choices[0] = Yes, choices[1] = No
-_CHOICES = ["Yes", "No"]
 
 @dataclass
 class _PendingApproval:
     description: str
     event: threading.Event = field(default_factory=threading.Event)
     approved: bool = False
-    cursor: int = 0          # 0 = Yes, 1 = No
-    panel_open: bool = False
 
 
 _pending_lock = threading.Lock()
 _pending: _PendingApproval | None = None
 
 
-def _render_lines(p: _PendingApproval) -> list[str]:
-    lines = [
-        p.description,
-        "",
-    ]
-    for i, choice in enumerate(_CHOICES):
-        marker = ">" if i == p.cursor else " "
-        lines.append(f"  {marker} {choice}")
-    return lines
-
-
-def _push_render(p: _PendingApproval) -> None:
-    emit({
-        "type": "panel_render",
-        "panel_id": PANEL_ID,
-        "title": "Allow Kagi API call?",
-        "lines": _render_lines(p),
-        "footer": "↑/↓ choose  enter confirm  esc cancel",
-    })
-
-
-def _open_panel(p: _PendingApproval) -> None:
-    p.panel_open = True
-    emit({
-        "type": "notify",
-        "level": "warn",
-        "message": f"Kagi API call pending (costs money) — approve or deny in the panel",
-    })
-    emit({
-        "type": "command_response",
-        "id": "__kagi_panel__",   # synthetic id — panel opened outside a command context
-        "action": "open_panel",
-        "open_panel": {
-            "id": PANEL_ID,
-            "title": "Allow Kagi API call?",
-            "lines": _render_lines(p),
-            "footer": "↑/↓ choose  enter confirm  esc cancel",
-        },
-    })
-
-
 def _request_approval(description: str) -> bool:
     """
-    Open an interactive yes/no panel and block until the user decides.
-    Returns True if approved, False if denied (or another call is pending).
+    Notify the user that a Kagi API call is waiting, then block until
+    they run /kagi-approve or /kagi-deny.
+    Returns True if approved, False if denied or another call is pending.
     """
     global _pending
 
@@ -131,7 +83,11 @@ def _request_approval(description: str) -> bool:
             return False
         _pending = approval
 
-    _open_panel(approval)
+    notify(
+        "warn",
+        f"Kagi API call pending (costs money): {description} — "
+        "run /kagi-approve to allow or /kagi-deny to cancel",
+    )
     approval.event.wait()
 
     with _pending_lock:
@@ -140,66 +96,19 @@ def _request_approval(description: str) -> bool:
     return approval.approved
 
 
-def handle_panel_key(frame: dict) -> None:
-    if frame.get("panel_id") != PANEL_ID:
-        return
-
-    with _pending_lock:
-        p = _pending
-
-    if p is None or not p.panel_open:
-        return
-
-    key = frame.get("key", "")
-
-    if key in ("up",):
-        p.cursor = max(0, p.cursor - 1)
-        _push_render(p)
-
-    elif key in ("down", "tab"):
-        p.cursor = min(len(_CHOICES) - 1, p.cursor + 1)
-        _push_render(p)
-
-    elif key == "enter":
-        p.approved = (p.cursor == 0)  # 0 = Yes
-        p.panel_open = False
-        emit({"type": "panel_close", "panel_id": PANEL_ID})
-        emit({"type": "clear_notes"})
-        p.event.set()
-
-    elif key == "esc":
-        p.approved = False
-        p.panel_open = False
-        emit({"type": "panel_close", "panel_id": PANEL_ID})
-        emit({"type": "clear_notes"})
-        p.event.set()
-
-    elif key == "rune":
-        text = frame.get("text", "")
-        if text in ("\n", "\r"):
-            p.approved = (p.cursor == 0)
-            p.panel_open = False
-            emit({"type": "panel_close", "panel_id": PANEL_ID})
-            emit({"type": "clear_notes"})
-            p.event.set()
-
-
-def handle_panel_close(frame: dict) -> None:
-    """Host closed our panel (e.g. user pressed Esc from the TUI side)."""
-    if frame.get("panel_id") != PANEL_ID:
-        return
-
+def handle_approve(approved: bool) -> str:
+    """Called by /kagi-approve or /kagi-deny command handlers."""
     with _pending_lock:
         p = _pending
 
     if p is None:
-        return
+        return "No Kagi API call is pending."
 
-    if p.panel_open:
-        p.panel_open = False
-        p.approved = False
-        emit({"type": "clear_notes"})
-        p.event.set()
+    p.approved = approved
+    emit({"type": "clear_notes"})
+    p.event.set()
+    return "Approved." if approved else "Denied."
+
 
 # ---------------------------------------------------------------------------
 # Kagi API client
@@ -225,12 +134,8 @@ def handle_kagi_search(call_id: str, args: dict) -> None:
     limit: int = int(args.get("limit", 10))
     limit = max(1, min(limit, 20))
 
-    description = f"kagi_search(query={query!r}, limit={limit})"
-    if not _request_approval(description):
-        tool_error(
-            call_id,
-            "Kagi search was denied by the user. Do not retry without asking the user first.",
-        )
+    if not _request_approval(f"kagi_search(query={query!r}, limit={limit})"):
+        tool_error(call_id, "Kagi search was denied by the user. Do not retry without asking the user first.")
         return
 
     try:
@@ -278,12 +183,8 @@ def handle_kagi_extract(call_id: str, args: dict) -> None:
         return
 
     short_urls = ", ".join(urls[:3]) + ("…" if len(urls) > 3 else "")
-    description = f"kagi_extract(urls=[{short_urls}], count={len(urls)})"
-    if not _request_approval(description):
-        tool_error(
-            call_id,
-            "Kagi extract was denied by the user. Do not retry without asking the user first.",
-        )
+    if not _request_approval(f"kagi_extract(urls=[{short_urls}], count={len(urls)})"):
+        tool_error(call_id, "Kagi extract was denied by the user. Do not retry without asking the user first.")
         return
 
     try:
@@ -327,7 +228,7 @@ def handle_kagi_extract(call_id: str, args: dict) -> None:
 # Registries
 # ---------------------------------------------------------------------------
 
-TOOLS: dict[str, Callable[[str, dict], None]] = {
+TOOL_HANDLERS: dict[str, Callable[[str, dict], None]] = {
     "kagi_search": handle_kagi_search,
     "kagi_extract": handle_kagi_extract,
 }
@@ -341,7 +242,19 @@ def main() -> None:
         "type": "hello",
         "name": "kagi",
         "version": "1.0.0",
-        "capabilities": ["tools", "panels"],
+        "capabilities": ["tools", "commands"],
+    })
+
+    emit({
+        "type": "register_command",
+        "name": "kagi-approve",
+        "description": "Approve the pending Kagi API call",
+    })
+
+    emit({
+        "type": "register_command",
+        "name": "kagi-deny",
+        "description": "Deny the pending Kagi API call",
     })
 
     emit({
@@ -397,16 +310,29 @@ def main() -> None:
 
         msg_type = msg.get("type")
 
-        if msg_type == "tool_call":
+        if msg_type == "command_invoked":
+            name = msg.get("name", "")
+            cmd_id = msg.get("id", "")
+            if name == "kagi-approve":
+                result = handle_approve(True)
+            elif name == "kagi-deny":
+                result = handle_approve(False)
+            else:
+                result = f"Unknown command: {name}"
+            emit({
+                "type": "command_response",
+                "id": cmd_id,
+                "action": "display",
+                "display": result,
+            })
+
+        elif msg_type == "tool_call":
             call_id = msg.get("id", "")
             name = msg.get("name", "")
             call_args = msg.get("args", {})
             log(f"tool_call: {name}  id={call_id}")
-            handler = TOOLS.get(name)
+            handler = TOOL_HANDLERS.get(name)
             if handler:
-                # Run on a worker thread so the approval wait doesn't
-                # block the main I/O loop (which must keep reading stdin
-                # to receive panel_key events).
                 threading.Thread(
                     target=handler,
                     args=(call_id, call_args),
@@ -415,21 +341,7 @@ def main() -> None:
             else:
                 tool_error(call_id, f"Unknown tool: {name}")
 
-        elif msg_type == "panel_key":
-            handle_panel_key(msg)
-
-        elif msg_type == "panel_close":
-            handle_panel_close(msg)
-
         elif msg_type == "shutdown":
-            # Unblock any waiting approval as a denied call so the
-            # worker thread exits cleanly before we ack.
-            with _pending_lock:
-                p = _pending
-            if p is not None:
-                p.approved = False
-                p.panel_open = False
-                p.event.set()
             log("shutting down")
             emit({"type": "shutdown_ack"})
             break
