@@ -21,6 +21,7 @@ from main import (
     _pending_lock,
     handle_panel_key,
     handle_panel_close,
+    handle_approve_command,
 )
 
 
@@ -30,34 +31,62 @@ from main import (
 
 def _run_approval_in_thread(description: str) -> dict:
     """
-    Runs _request_approval in a background thread.
+    Runs _request_approval in a background thread and simulates the host
+    round-trip that actually opens the panel.
+
+    In the panel-based design _request_approval does NOT open the panel
+    itself: it emits a submit_slash frame for /kagi-approve and blocks.
+    The host then dispatches command_invoked back, which the extension
+    handles in handle_approve_command -> that is what opens the panel.
+    This helper emulates that dispatch as soon as the submit_slash frame
+    appears, so tests see the open_panel frame just like in production.
+
     Returns a dict with keys:
-      'result'  – True/False once resolved
+      'value'   – True/False once resolved
       'thread'  – the Thread object
       'emitted' – list of JSON objects written to stdout during approval
     """
     result = {}
     emitted = []
+    emit_lock = threading.Lock()
+    slash_seen = threading.Event()
 
     def _capture_emit(obj):
-        emitted.append(obj)
+        with emit_lock:
+            emitted.append(obj)
+        if obj.get("type") == "submit_slash" and obj.get("text") == "/kagi-approve":
+            slash_seen.set()
 
     def _worker():
         with patch("main.emit", side_effect=_capture_emit):
             result["value"] = main._request_approval(description)
 
+    def _host():
+        # Act as the host: when the tool thread requests approval via
+        # submit_slash, dispatch /kagi-approve back so the panel opens.
+        if slash_seen.wait(timeout=2.0):
+            with patch("main.emit", side_effect=_capture_emit):
+                handle_approve_command("cmd-test")
+
     t = threading.Thread(target=_worker, daemon=True)
+    h = threading.Thread(target=_host, daemon=True)
     result["thread"] = t
+    result["host_thread"] = h
     result["emitted"] = emitted
+    result["_emit_lock"] = emit_lock
     t.start()
+    h.start()
     return result
 
 
 def _wait_for_panel_open(result: dict, timeout: float = 1.0) -> bool:
-    """Wait until the approval thread has opened the panel (emitted open_panel)."""
+    """Wait until the panel has been opened (open_panel frame emitted)."""
     deadline = time.monotonic() + timeout
+    lock = result.get("_emit_lock")
     while time.monotonic() < deadline:
-        for obj in result["emitted"]:
+        with lock:
+            snapshot = list(result["emitted"])
+        for obj in snapshot:
             if obj.get("action") == "open_panel":
                 return True
         time.sleep(0.01)
