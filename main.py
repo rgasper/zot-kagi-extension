@@ -76,13 +76,19 @@ def notify(level: str, message: str) -> None:
 # ---------------------------------------------------------------------------
 # Options: 0 = "Use cached result", 1 = "Make live API call"
 
-_CACHE_OPTIONS = ["Use cached result  (free)", "Make live API call  (costs money)"]
+_CACHE_OPTIONS = ["Use cached result  (free)", "Make live API call  (costs money)", "Deny entirely"]
+
+class _CacheChoice:
+    USE_CACHE = "use_cache"
+    LIVE_CALL = "live_call"
+    DENY      = "deny"
+
 
 @dataclass
 class _PendingCacheDecision:
     hit: kagi_cache.CacheHit
     event: threading.Event = field(default_factory=threading.Event)
-    use_cache: bool = True   # default — use cache
+    choice: str = _CacheChoice.USE_CACHE
     cursor: int = 0
     panel_open: bool = False
 
@@ -104,6 +110,8 @@ def _render_cache_lines(p: _PendingCacheDecision) -> list[str]:
     for i, option in enumerate(_CACHE_OPTIONS):
         marker = ">" if i == p.cursor else " "
         lines.append(f"  {marker} {option}")
+    lines.append("")
+    lines.append("  esc / ctrl-c  →  deny entirely")
     return lines
 
 
@@ -113,22 +121,22 @@ def _push_cache_render(p: _PendingCacheDecision) -> None:
         "panel_id": CACHE_PANEL_ID,
         "title": "Kagi Cache Hit",
         "lines": _render_cache_lines(p),
-        "footer": "↑/↓ or tab to toggle  ·  enter to confirm  ·  esc to use cache",
+        "footer": "↑/↓  move  ·  enter  confirm  ·  esc/ctrl-c  deny entirely",
     })
 
 
-def _resolve_cache(p: _PendingCacheDecision, use_cache: bool) -> None:
+def _resolve_cache(p: _PendingCacheDecision, choice: str) -> None:
     p.panel_open = False
-    p.use_cache = use_cache
+    p.choice = choice
     emit({"type": "panel_close", "panel_id": CACHE_PANEL_ID})
     emit({"type": "clear_notes"})
     p.event.set()
 
 
-def _request_cache_decision(hit: kagi_cache.CacheHit) -> bool:
+def _request_cache_decision(hit: kagi_cache.CacheHit) -> str:
     """
     Open the cache-hit panel and block until the user chooses.
-    Returns True to use cache, False to make a live call.
+    Returns a _CacheChoice constant: USE_CACHE, LIVE_CALL, or DENY.
     """
     global _cache_decision
 
@@ -136,7 +144,7 @@ def _request_cache_decision(hit: kagi_cache.CacheHit) -> bool:
 
     with _cache_decision_lock:
         if _cache_decision is not None:
-            return True   # safe default: use cache
+            return _CacheChoice.USE_CACHE   # safe default: use cache
         _cache_decision = decision
 
     emit({"type": "submit_slash", "text": "/kagi-cache-hit"})
@@ -145,7 +153,7 @@ def _request_cache_decision(hit: kagi_cache.CacheHit) -> bool:
     with _cache_decision_lock:
         _cache_decision = None
 
-    return decision.use_cache
+    return decision.choice
 
 
 def handle_cache_hit_command(cmd_id: str) -> None:
@@ -170,7 +178,7 @@ def handle_cache_hit_command(cmd_id: str) -> None:
             "id": CACHE_PANEL_ID,
             "title": "Kagi Cache Hit",
             "lines": _render_cache_lines(p),
-            "footer": "↑/↓ or tab to toggle  ·  enter to confirm  ·  esc to use cache",
+            "footer": "↑/↓  move  ·  enter  confirm  ·  esc/ctrl-c  deny entirely",
         },
     })
 
@@ -194,16 +202,19 @@ def handle_cache_panel_key(frame: dict) -> None:
         p.cursor = min(len(_CACHE_OPTIONS) - 1, p.cursor + 1)
         _push_cache_render(p)
     elif key == "enter":
-        _resolve_cache(p, use_cache=(p.cursor == 0))
+        choices = [_CacheChoice.USE_CACHE, _CacheChoice.LIVE_CALL, _CacheChoice.DENY]
+        _resolve_cache(p, choices[p.cursor])
     elif key == "esc":
-        _resolve_cache(p, use_cache=True)
+        _resolve_cache(p, _CacheChoice.DENY)
     elif key == "rune":
         text = frame.get("text", "")
         if text in ("\n", "\r"):
-            _resolve_cache(p, use_cache=(p.cursor == 0))
+            choices = [_CacheChoice.USE_CACHE, _CacheChoice.LIVE_CALL, _CacheChoice.DENY]
+            _resolve_cache(p, choices[p.cursor])
 
 
 def handle_cache_panel_close(frame: dict) -> None:
+    """Host closed the panel (e.g. ctrl-c in TUI) — treat as deny entirely."""
     if frame.get("panel_id") != CACHE_PANEL_ID:
         return
     with _cache_decision_lock:
@@ -212,7 +223,7 @@ def handle_cache_panel_close(frame: dict) -> None:
         return
     emit({"type": "clear_notes"})
     p.panel_open = False
-    p.use_cache = True
+    p.choice = _CacheChoice.DENY
     p.event.set()
 
 
@@ -361,11 +372,14 @@ def handle_kagi_search(call_id: str, args: dict) -> None:
     hit = kagi_cache.search_cache_lookup(query)
     if hit is not None:
         log(f"cache hit for search query={query!r} sim={hit.similarity:.2f}")
-        use_cache = _request_cache_decision(hit)
-        if use_cache:
+        choice = _request_cache_decision(hit)
+        if choice == _CacheChoice.USE_CACHE:
             tool_ok(call_id, hit.result)
             return
-        # User wants a live call — fall through to approval + API
+        if choice == _CacheChoice.DENY:
+            tool_error(call_id, "Kagi search was denied by the user. Do not retry without asking the user first.")
+            return
+        # LIVE_CALL — fall through to approval + API
 
     # --- Approval gate ---
     if not _request_approval(f"kagi_search(query={query!r}, limit={limit})"):
@@ -429,10 +443,14 @@ def handle_kagi_extract(call_id: str, args: dict) -> None:
     hit = kagi_cache.extract_cache_lookup(urls)
     if hit is not None:
         log(f"cache hit for extract urls={urls}")
-        use_cache = _request_cache_decision(hit)
-        if use_cache:
+        choice = _request_cache_decision(hit)
+        if choice == _CacheChoice.USE_CACHE:
             tool_ok(call_id, hit.result)
             return
+        if choice == _CacheChoice.DENY:
+            tool_error(call_id, "Kagi extract was denied by the user. Do not retry without asking the user first.")
+            return
+        # LIVE_CALL — fall through to approval + API
 
     # --- Approval gate ---
     short_urls = ", ".join(urls[:3]) + ("…" if len(urls) > 3 else "")
