@@ -34,17 +34,21 @@ def _make_extract_response(pages: list) -> openapi_client.ExtractResponse:
 def _capture_extract(args: dict, env: dict | None = None) -> dict:
     env = {"KAGI_API_KEY": "test-key", **(env or {})}
     buf = StringIO()
-    with patch.dict("os.environ", env, clear=False):
-        with patch("sys.stdout", buf):
-            main.handle_kagi_extract("call-1", args)
+    with patch("main.kagi_cache.extract_cache_lookup", return_value=None):
+        with patch("main.kagi_cache.extract_cache_store"):
+            with patch.dict("os.environ", env, clear=False):
+                with patch("sys.stdout", buf):
+                    main.handle_kagi_extract("call-1", args)
     return json.loads(buf.getvalue().strip())
 
 
 @contextmanager
 def _auto_approve():
-    """Patch the approval gate to always approve — used in all non-denial tests."""
+    """Patch the approval gate to always approve and suppress cache lookups."""
     with patch("main._request_approval", return_value=True):
-        yield
+        with patch("main.kagi_cache.extract_cache_lookup", return_value=None):
+            with patch("main.kagi_cache.extract_cache_store"):
+                yield
 
 
 @contextmanager
@@ -63,9 +67,12 @@ def _mock_extract_api(response=None, side_effect=None):
     mock_client.__exit__ = MagicMock(return_value=False)
 
     with _auto_approve():
-        with patch("main._client", return_value=mock_client):
-            with patch("openapi_client.ExtractApi", return_value=mock_api):
-                yield mock_api
+        with patch("main._request_cache_decision", return_value=False):
+            with patch("main.kagi_cache.extract_cache_lookup", return_value=None):
+                with patch("main.kagi_cache.extract_cache_store"):
+                    with patch("main._client", return_value=mock_client):
+                        with patch("openapi_client.ExtractApi", return_value=mock_api):
+                            yield mock_api
 
 
 # ---------------------------------------------------------------------------
@@ -97,13 +104,12 @@ class TestExtractInputValidation:
         assert frame.get("is_error") is not True
 
     def test_missing_api_key_returns_error(self):
-        # Don't set KAGI_API_KEY at all — gate is auto-approved so we reach
-        # the _client() check, which raises RuntimeError caught as is_error.
         buf = StringIO()
         with _auto_approve():
-            with patch.dict("os.environ", {}, clear=True):
-                with patch("sys.stdout", buf):
-                    main.handle_kagi_extract("c1", {"urls": ["https://example.com"]})
+            with patch("main.kagi_cache.extract_cache_lookup", return_value=None):
+                with patch.dict("os.environ", {}, clear=True):
+                    with patch("sys.stdout", buf):
+                        main.handle_kagi_extract("c1", {"urls": ["https://example.com"]})
         frame = json.loads(buf.getvalue().strip())
         assert frame["is_error"] is True
         assert "KAGI_API_KEY" in frame["content"][0]["text"]

@@ -11,15 +11,29 @@ panel shows Yes / No and is navigated with the keyboard.
 
 Only one Kagi call can be pending at a time.  If the agent fires a
 second call while one is already waiting, it is immediately denied.
+
+Cache
+-----
+Search queries and extract URLs are stored in a local SQLite database.
+When a new tool call arrives, the cache is checked first:
+  - kagi_search: cosine-similarity match against stored queries
+  - kagi_extract: exact URL-set match
+
+If a match is found above the threshold, a "cache hit" panel is shown
+that lets the user return the stored result (free) or proceed with a
+live API call (costs money).
 """
 import json
 import os
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Optional
 
 import openapi_client  # type: ignore
+
+import cache as kagi_cache
 
 # ---------------------------------------------------------------------------
 # Wire-protocol helpers
@@ -27,7 +41,8 @@ import openapi_client  # type: ignore
 
 _emit_lock = threading.Lock()
 
-PANEL_ID = "kagi-approve"
+APPROVE_PANEL_ID = "kagi-approve"
+CACHE_PANEL_ID   = "kagi-cache-hit"
 
 def emit(obj: dict) -> None:
     with _emit_lock:
@@ -57,6 +72,151 @@ def notify(level: str, message: str) -> None:
     emit({"type": "notify", "level": level, "message": message})
 
 # ---------------------------------------------------------------------------
+# Cache-hit approval panel
+# ---------------------------------------------------------------------------
+# Options: 0 = "Use cached result", 1 = "Make live API call"
+
+_CACHE_OPTIONS = ["Use cached result  (free)", "Make live API call  (costs money)"]
+
+@dataclass
+class _PendingCacheDecision:
+    hit: kagi_cache.CacheHit
+    event: threading.Event = field(default_factory=threading.Event)
+    use_cache: bool = True   # default — use cache
+    cursor: int = 0
+    panel_open: bool = False
+
+
+_cache_decision_lock = threading.Lock()
+_cache_decision: Optional[_PendingCacheDecision] = None
+
+
+def _render_cache_lines(p: _PendingCacheDecision) -> list[str]:
+    import datetime
+    when = datetime.datetime.fromtimestamp(p.hit.created_at).strftime("%Y-%m-%d %H:%M")
+    sim_pct = int(p.hit.similarity * 100)
+    lines = [
+        "A cached result was found for this query.",
+        f"  Original: {p.hit.original_query[:80]}",
+        f"  Cached:   {when}  ·  similarity {sim_pct}%",
+        "",
+    ]
+    for i, option in enumerate(_CACHE_OPTIONS):
+        marker = ">" if i == p.cursor else " "
+        lines.append(f"  {marker} {option}")
+    return lines
+
+
+def _push_cache_render(p: _PendingCacheDecision) -> None:
+    emit({
+        "type": "panel_render",
+        "panel_id": CACHE_PANEL_ID,
+        "title": "Kagi Cache Hit",
+        "lines": _render_cache_lines(p),
+        "footer": "↑/↓ or tab to toggle  ·  enter to confirm  ·  esc to use cache",
+    })
+
+
+def _resolve_cache(p: _PendingCacheDecision, use_cache: bool) -> None:
+    p.panel_open = False
+    p.use_cache = use_cache
+    emit({"type": "panel_close", "panel_id": CACHE_PANEL_ID})
+    emit({"type": "clear_notes"})
+    p.event.set()
+
+
+def _request_cache_decision(hit: kagi_cache.CacheHit) -> bool:
+    """
+    Open the cache-hit panel and block until the user chooses.
+    Returns True to use cache, False to make a live call.
+    """
+    global _cache_decision
+
+    decision = _PendingCacheDecision(hit=hit)
+
+    with _cache_decision_lock:
+        if _cache_decision is not None:
+            return True   # safe default: use cache
+        _cache_decision = decision
+
+    emit({"type": "submit_slash", "text": "/kagi-cache-hit"})
+    decision.event.wait()
+
+    with _cache_decision_lock:
+        _cache_decision = None
+
+    return decision.use_cache
+
+
+def handle_cache_hit_command(cmd_id: str) -> None:
+    with _cache_decision_lock:
+        p = _cache_decision
+
+    if p is None:
+        emit({
+            "type": "command_response",
+            "id": cmd_id,
+            "action": "display",
+            "display": "No cache decision pending.",
+        })
+        return
+
+    p.panel_open = True
+    emit({
+        "type": "command_response",
+        "id": cmd_id,
+        "action": "open_panel",
+        "open_panel": {
+            "id": CACHE_PANEL_ID,
+            "title": "Kagi Cache Hit",
+            "lines": _render_cache_lines(p),
+            "footer": "↑/↓ or tab to toggle  ·  enter to confirm  ·  esc to use cache",
+        },
+    })
+
+
+def handle_cache_panel_key(frame: dict) -> None:
+    if frame.get("panel_id") != CACHE_PANEL_ID:
+        return
+
+    with _cache_decision_lock:
+        p = _cache_decision
+
+    if p is None or not p.panel_open:
+        return
+
+    key = frame.get("key", "")
+
+    if key == "up":
+        p.cursor = max(0, p.cursor - 1)
+        _push_cache_render(p)
+    elif key in ("down", "tab"):
+        p.cursor = min(len(_CACHE_OPTIONS) - 1, p.cursor + 1)
+        _push_cache_render(p)
+    elif key == "enter":
+        _resolve_cache(p, use_cache=(p.cursor == 0))
+    elif key == "esc":
+        _resolve_cache(p, use_cache=True)
+    elif key == "rune":
+        text = frame.get("text", "")
+        if text in ("\n", "\r"):
+            _resolve_cache(p, use_cache=(p.cursor == 0))
+
+
+def handle_cache_panel_close(frame: dict) -> None:
+    if frame.get("panel_id") != CACHE_PANEL_ID:
+        return
+    with _cache_decision_lock:
+        p = _cache_decision
+    if p is None:
+        return
+    emit({"type": "clear_notes"})
+    p.panel_open = False
+    p.use_cache = True
+    p.event.set()
+
+
+# ---------------------------------------------------------------------------
 # Approval gate (panel-based)
 # ---------------------------------------------------------------------------
 
@@ -67,12 +227,12 @@ class _PendingApproval:
     description: str
     event: threading.Event = field(default_factory=threading.Event)
     approved: bool = False
-    cursor: int = 0        # 0 = Yes, 1 = No
+    cursor: int = 0
     panel_open: bool = False
 
 
 _pending_lock = threading.Lock()
-_pending: _PendingApproval | None = None
+_pending: Optional[_PendingApproval] = None
 
 
 def _render_lines(p: _PendingApproval) -> list[str]:
@@ -90,7 +250,7 @@ def _render_lines(p: _PendingApproval) -> list[str]:
 def _push_render(p: _PendingApproval) -> None:
     emit({
         "type": "panel_render",
-        "panel_id": PANEL_ID,
+        "panel_id": APPROVE_PANEL_ID,
         "title": "Kagi API Approval",
         "lines": _render_lines(p),
         "footer": "↑/↓ or tab to select  ·  enter to confirm  ·  esc to deny",
@@ -98,20 +258,14 @@ def _push_render(p: _PendingApproval) -> None:
 
 
 def _resolve(p: _PendingApproval, approved: bool) -> None:
-    """Close the panel, clear notes, and unblock the waiting thread."""
     p.panel_open = False
     p.approved = approved
-    emit({"type": "panel_close", "panel_id": PANEL_ID})
+    emit({"type": "panel_close", "panel_id": APPROVE_PANEL_ID})
     emit({"type": "clear_notes"})
     p.event.set()
 
 
 def _request_approval(description: str) -> bool:
-    """
-    Open an interactive approval panel and block until the user
-    approves or denies the pending Kagi API call.
-    Returns True if approved, False if denied or another call is already pending.
-    """
     global _pending
 
     approval = _PendingApproval(description=description)
@@ -121,9 +275,6 @@ def _request_approval(description: str) -> bool:
             return False
         _pending = approval
 
-    # Trigger the /kagi-approve command via submit_slash so the host
-    # dispatches command_invoked back to us, and we can return open_panel
-    # from that command handler — the only supported way to open a panel.
     notify(
         "warn",
         f"Kagi API call pending (costs money): {description}",
@@ -139,8 +290,7 @@ def _request_approval(description: str) -> bool:
 
 
 def handle_panel_key(frame: dict) -> None:
-    """Dispatch keyboard events for the approval panel."""
-    if frame.get("panel_id") != PANEL_ID:
+    if frame.get("panel_id") != APPROVE_PANEL_ID:
         return
 
     with _pending_lock:
@@ -154,27 +304,21 @@ def handle_panel_key(frame: dict) -> None:
     if key == "up":
         p.cursor = max(0, p.cursor - 1)
         _push_render(p)
-
     elif key in ("down", "tab"):
         p.cursor = min(len(_OPTIONS) - 1, p.cursor + 1)
         _push_render(p)
-
     elif key == "enter":
         _resolve(p, approved=(p.cursor == 0))
-
     elif key == "esc":
         _resolve(p, approved=False)
-
     elif key == "rune":
         text = frame.get("text", "")
         if text in ("\n", "\r"):
             _resolve(p, approved=(p.cursor == 0))
-        # Other runes are ignored in a Yes/No selector
 
 
 def handle_panel_close(frame: dict) -> None:
-    """The host closed the panel (e.g. user pressed Ctrl+C in TUI)."""
-    if frame.get("panel_id") != PANEL_ID:
+    if frame.get("panel_id") != APPROVE_PANEL_ID:
         return
 
     with _pending_lock:
@@ -183,7 +327,6 @@ def handle_panel_close(frame: dict) -> None:
     if p is None:
         return
 
-    # Treat host-initiated close as a deny.
     emit({"type": "clear_notes"})
     p.panel_open = False
     p.approved = False
@@ -214,6 +357,17 @@ def handle_kagi_search(call_id: str, args: dict) -> None:
     limit: int = int(args.get("limit", 10))
     limit = max(1, min(limit, 20))
 
+    # --- Cache lookup ---
+    hit = kagi_cache.search_cache_lookup(query)
+    if hit is not None:
+        log(f"cache hit for search query={query!r} sim={hit.similarity:.2f}")
+        use_cache = _request_cache_decision(hit)
+        if use_cache:
+            tool_ok(call_id, hit.result)
+            return
+        # User wants a live call — fall through to approval + API
+
+    # --- Approval gate ---
     if not _request_approval(f"kagi_search(query={query!r}, limit={limit})"):
         tool_error(call_id, "Kagi search was denied by the user. Do not retry without asking the user first.")
         return
@@ -250,7 +404,16 @@ def handle_kagi_search(call_id: str, args: dict) -> None:
             lines.append(f"   {snippet}")
         lines.append("")
 
-    tool_ok(call_id, "\n".join(lines).strip())
+    result_text = "\n".join(lines).strip()
+
+    # --- Store in cache ---
+    try:
+        kagi_cache.search_cache_store(query, result_text)
+        log(f"cached search result for query={query!r}")
+    except Exception as exc:  # noqa: BLE001
+        log(f"cache write failed: {exc}")
+
+    tool_ok(call_id, result_text)
 
 
 def handle_kagi_extract(call_id: str, args: dict) -> None:
@@ -262,6 +425,16 @@ def handle_kagi_extract(call_id: str, args: dict) -> None:
         tool_error(call_id, "Too many URLs: maximum is 10 per request")
         return
 
+    # --- Cache lookup (exact URL set) ---
+    hit = kagi_cache.extract_cache_lookup(urls)
+    if hit is not None:
+        log(f"cache hit for extract urls={urls}")
+        use_cache = _request_cache_decision(hit)
+        if use_cache:
+            tool_ok(call_id, hit.result)
+            return
+
+    # --- Approval gate ---
     short_urls = ", ".join(urls[:3]) + ("…" if len(urls) > 3 else "")
     if not _request_approval(f"kagi_extract(urls=[{short_urls}], count={len(urls)})"):
         tool_error(call_id, "Kagi extract was denied by the user. Do not retry without asking the user first.")
@@ -302,7 +475,16 @@ def handle_kagi_extract(call_id: str, args: dict) -> None:
             parts.append("*(no content returned)*")
         parts.append("\n---\n")
 
-    tool_ok(call_id, "\n".join(parts).strip())
+    result_text = "\n".join(parts).strip()
+
+    # --- Store in cache ---
+    try:
+        kagi_cache.extract_cache_store(urls, result_text)
+        log(f"cached extract result for {len(urls)} url(s)")
+    except Exception as exc:  # noqa: BLE001
+        log(f"cache write failed: {exc}")
+
+    tool_ok(call_id, result_text)
 
 # ---------------------------------------------------------------------------
 # Registries
@@ -314,11 +496,10 @@ TOOL_HANDLERS: dict[str, Callable[[str, dict], None]] = {
 }
 
 # ---------------------------------------------------------------------------
-# Main loop
+# /kagi-approve command handler
 # ---------------------------------------------------------------------------
 
 def handle_approve_command(cmd_id: str) -> None:
-    """Called when /kagi-approve is invoked (triggered by submit_slash from a tool thread)."""
     with _pending_lock:
         p = _pending
 
@@ -337,28 +518,100 @@ def handle_approve_command(cmd_id: str) -> None:
         "id": cmd_id,
         "action": "open_panel",
         "open_panel": {
-            "id": PANEL_ID,
+            "id": APPROVE_PANEL_ID,
             "title": "Kagi API Approval",
             "lines": _render_lines(p),
             "footer": "↑/↓ or tab to select  ·  enter to confirm  ·  esc to deny",
         },
     })
 
+# ---------------------------------------------------------------------------
+# /kagi-cache command handler
+# ---------------------------------------------------------------------------
+
+def handle_cache_command(cmd_id: str, args: str) -> None:
+    """Display cache statistics and recent entries."""
+    try:
+        stats = kagi_cache.cache_stats()
+        recent = kagi_cache.list_recent(limit=10)
+    except Exception as exc:  # noqa: BLE001
+        emit({
+            "type": "command_response",
+            "id": cmd_id,
+            "action": "display",
+            "display": f"Cache error: {exc}",
+        })
+        return
+
+    def fmt_bytes(b: int) -> str:
+        if b < 1024:
+            return f"{b} B"
+        if b < 1024 * 1024:
+            return f"{b/1024:.1f} KB"
+        return f"{b/1024/1024:.1f} MB"
+
+    lines = [
+        "**Kagi Cache Statistics**",
+        "",
+        f"Searches: {stats['search_count']} entries  ({fmt_bytes(stats['search_bytes'])} compressed)",
+        f"Extracts: {stats['extract_count']} entries  ({fmt_bytes(stats['extract_bytes'])} compressed)",
+        "",
+        "**Recent searches:**",
+    ]
+
+    import datetime
+    for row in recent["searches"]:
+        when = datetime.datetime.fromtimestamp(row["created_at"]).strftime("%Y-%m-%d %H:%M")
+        lines.append(f"  [{when}] {row['query'][:70]}  ({fmt_bytes(row['compressed_size'])})")
+
+    if not recent["searches"]:
+        lines.append("  (none)")
+
+    lines += ["", "**Recent extracts:**"]
+    for row in recent["extracts"]:
+        when = datetime.datetime.fromtimestamp(row["created_at"]).strftime("%Y-%m-%d %H:%M")
+        urls = json.loads(row["urls_json"])
+        label = urls[0][:60] + ("…" if len(urls) > 1 or len(urls[0]) > 60 else "")
+        lines.append(f"  [{when}] {label}  ({fmt_bytes(row['compressed_size'])})")
+
+    if not recent["extracts"]:
+        lines.append("  (none)")
+
+    emit({
+        "type": "command_response",
+        "id": cmd_id,
+        "action": "display",
+        "display": "\n".join(lines),
+    })
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     emit({
         "type": "hello",
         "name": "kagi",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "capabilities": ["tools", "commands", "panels"],
     })
 
-    # /kagi-approve is not meant to be typed manually — it's triggered
-    # internally via submit_slash when a tool needs approval.
     emit({
         "type": "register_command",
         "name": "kagi-approve",
         "description": "(internal) open the Kagi API approval panel",
+    })
+
+    emit({
+        "type": "register_command",
+        "name": "kagi-cache-hit",
+        "description": "(internal) open the Kagi cache-hit decision panel",
+    })
+
+    emit({
+        "type": "register_command",
+        "name": "kagi-cache",
+        "description": "Show Kagi cache statistics and recent cached queries",
     })
 
     emit({
@@ -417,8 +670,13 @@ def main() -> None:
         if msg_type == "command_invoked":
             name = msg.get("name", "")
             cmd_id = msg.get("id", "")
+            args_str = msg.get("args", "")
             if name == "kagi-approve":
                 handle_approve_command(cmd_id)
+            elif name == "kagi-cache-hit":
+                handle_cache_hit_command(cmd_id)
+            elif name == "kagi-cache":
+                handle_cache_command(cmd_id, args_str)
             else:
                 emit({"type": "command_response", "id": cmd_id, "action": "display",
                       "display": f"Unknown command: {name}"})
@@ -439,10 +697,19 @@ def main() -> None:
                 tool_error(call_id, f"Unknown tool: {name}")
 
         elif msg_type == "panel_key":
-            handle_panel_key(msg)
+            # Route to the right panel handler by panel_id
+            panel_id = msg.get("panel_id", "")
+            if panel_id == CACHE_PANEL_ID:
+                handle_cache_panel_key(msg)
+            else:
+                handle_panel_key(msg)
 
         elif msg_type == "panel_close":
-            handle_panel_close(msg)
+            panel_id = msg.get("panel_id", "")
+            if panel_id == CACHE_PANEL_ID:
+                handle_cache_panel_close(msg)
+            else:
+                handle_panel_close(msg)
 
         elif msg_type == "shutdown":
             log("shutting down")

@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 import main
 from main import (
-    PANEL_ID,
+    APPROVE_PANEL_ID as PANEL_ID,
     _PendingApproval,
     _pending_lock,
     handle_panel_key,
